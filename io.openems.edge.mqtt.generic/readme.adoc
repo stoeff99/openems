@@ -1,0 +1,74 @@
+= Generic MQTT Components
+
+Read meters, a battery, dynamic tariffs and a PV forecast from any MQTT broker.
+Every component uses the existing link:../io.openems.edge.bridge.mqtt/readme.adoc[Bridge.Mqtt]
+for the broker connection.
+
+The idea is a topic mapping: each configuration field is one OpenEMS signal, and you
+paste the source topic into it. Leave a field empty to skip that signal.
+
+== Payload formats
+
+All numeric topics accept:
+
+* plain numbers: `-1333.01` (LoxBerry, Node-RED, ioBroker, ...)
+* JSON with a `value` field: `{"value": -1333.01}` (native Victron Venus OS)
+* any JSON with a configured dotted `JSON Path`, e.g. `data.power`
+
+== Components
+
+=== Meter.Mqtt
+
+Electricity meter. Set *Meter-Type* to `GRID`, `PRODUCTION` or `CONSUMPTION_METERED`.
+
+* OpenEMS convention for GRID: `+` = buy from grid, `-` = feed-in. Use *Invert Power* if your source uses the opposite sign.
+* If no total power topic is given, the total is the sum of the L1/L2/L3 topics.
+* If no energy topics are given, energy is integrated from power.
+* After *Timeout* seconds without a power message, power becomes undefined and `MqttCommunicationFailed` is set.
+
+=== Ess.Mqtt (read-only)
+
+Battery storage with SoC, power, capacity, energy counters, cell voltages and temperature.
+OpenEMS convention: `+` = discharge, `-` = charge. Victron reports the opposite, so
+*Invert Power* is enabled by default. OpenEMS does *not* control this battery.
+
+=== TimeOfUseTariff.Mqtt
+
+Dynamic prices from a JSON array on one topic. Defaults match an EKZ feed:
+
+[source,json]
+----
+{"intervals":[{"start_timestamp":"2026-11-11T00:00:00+01:00","chf_per_kwh_sum":0.19876, ...}, ...]}
+----
+
+Prices are converted from per kWh to per MWh (*Price scale* 1000). They are used as-is in the
+currency configured in `Core.Meta`, so set that currency to CHF.
+
+=== Predictor.Mqtt.HourlyForecast
+
+PV forecast from hourly kWh topics `<prefix>today_hour_HH_kwh` and `<prefix>tomorrow_hour_HH_kwh`
+(e.g. a Solcast LoxBerry plugin). One hour of kWh is used as the average power for its four quarters.
+Provided for `_sum/ProductionActivePower` by default.
+
+== Example: Victron Cerbo GX via LoxBerry
+
+|===
+|Component |Field |Topic
+
+|Bridge.Mqtt `mqtt0` |host / port |your broker
+|Ess.Mqtt `ess0` |SoC |`Cerbo/N/<portalId>/system/0/Dc/Battery/Soc`
+| |Active Power (Invert Power = true) |`Cerbo/N/<portalId>/system/0/Dc/Battery/Power`
+| |Charged / Discharged Energy |`Cerbo/N/<portalId>/battery/512/History/ChargedEnergy` / `.../DischargedEnergy`
+| |Min / Max Cell Voltage |`Cerbo/N/<portalId>/battery/512/System/MinCellVoltage` / `.../MaxCellVoltage`
+| |Temperature |`Cerbo/N/<portalId>/system/0/Dc/Battery/Temperature`
+|Meter.Mqtt `meter1` (PRODUCTION) |Active Power |`Cerbo/N/<portalId>/pvinverter/20/Ac/Power`
+| |Production Energy |`Cerbo/N/<portalId>/pvinverter/20/Ac/Energy/Forward`
+|Meter.Mqtt `meter0` (GRID) |Active Power L1/L2/L3 |`Cerbo/N/<portalId>/system/0/Ac/Grid/L1/Power` (L2, L3)
+|TimeOfUseTariff.Mqtt |Topic |`ekz/ems/tariffs/intervals`
+|Predictor.Mqtt.HourlyForecast |Topic prefix |`solcast/sum/`
+|===
+
+House consumption does not need its own meter: OpenEMS calculates it as
+grid + production + battery discharge.
+
+https://github.com/stoeff99/openems/tree/develop/io.openems.edge.mqtt.generic[Source Code icon:github[]]

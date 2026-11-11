@@ -1,0 +1,219 @@
+package io.openems.edge.mqtt.generic.ess;
+
+import static io.openems.edge.mqtt.generic.common.MqttSubscriptions.isSet;
+import static io.openems.edge.mqtt.generic.common.MqttValues.toInt;
+import static io.openems.edge.mqtt.generic.common.MqttValues.toLong;
+import static org.osgi.service.component.annotations.ConfigurationPolicy.REQUIRE;
+import static org.osgi.service.component.annotations.ReferenceCardinality.MANDATORY;
+import static org.osgi.service.component.annotations.ReferenceCardinality.OPTIONAL;
+import static org.osgi.service.component.annotations.ReferencePolicy.DYNAMIC;
+import static org.osgi.service.component.annotations.ReferencePolicy.STATIC;
+import static org.osgi.service.component.annotations.ReferencePolicyOption.GREEDY;
+
+import java.time.Duration;
+import java.time.Instant;
+
+import org.osgi.service.cm.ConfigurationAdmin;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Deactivate;
+import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.event.Event;
+import org.osgi.service.event.EventHandler;
+import org.osgi.service.event.propertytypes.EventTopics;
+import org.osgi.service.metatype.annotations.Designate;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.openems.common.channel.AccessMode;
+import io.openems.edge.bridge.mqtt.api.BridgeMqtt;
+import io.openems.edge.bridge.mqtt.api.MqttComponent;
+import io.openems.edge.bridge.mqtt.api.MqttMessage;
+import io.openems.edge.common.component.AbstractOpenemsComponent;
+import io.openems.edge.common.component.ComponentManager;
+import io.openems.edge.common.component.OpenemsComponent;
+import io.openems.edge.common.event.EdgeEventConstants;
+import io.openems.edge.common.modbusslave.ModbusSlave;
+import io.openems.edge.common.modbusslave.ModbusSlaveTable;
+import io.openems.edge.common.sum.GridMode;
+import io.openems.edge.ess.api.SymmetricEss;
+import io.openems.edge.mqtt.generic.common.MqttSubscriptions;
+import io.openems.edge.mqtt.generic.common.MqttValues;
+import io.openems.edge.timedata.api.Timedata;
+import io.openems.edge.timedata.api.TimedataProvider;
+import io.openems.edge.timedata.api.utils.CalculateEnergyFromPower;
+
+@Designate(ocd = Config.class, factory = true)
+@Component(//
+		name = "Ess.Mqtt", //
+		immediate = true, //
+		configurationPolicy = REQUIRE)
+@EventTopics({ //
+		EdgeEventConstants.TOPIC_CYCLE_BEFORE_PROCESS_IMAGE, //
+		EdgeEventConstants.TOPIC_CYCLE_AFTER_PROCESS_IMAGE //
+})
+public class EssMqttImpl extends AbstractOpenemsComponent implements EssMqtt, SymmetricEss, MqttComponent,
+		OpenemsComponent, TimedataProvider, EventHandler, ModbusSlave {
+
+	private final Logger log = LoggerFactory.getLogger(EssMqttImpl.class);
+
+	private final CalculateEnergyFromPower calculateChargeEnergy = new CalculateEnergyFromPower(this,
+			SymmetricEss.ChannelId.ACTIVE_CHARGE_ENERGY);
+	private final CalculateEnergyFromPower calculateDischargeEnergy = new CalculateEnergyFromPower(this,
+			SymmetricEss.ChannelId.ACTIVE_DISCHARGE_ENERGY);
+	private final MqttSubscriptions subscriptions = new MqttSubscriptions();
+
+	@Reference
+	private ConfigurationAdmin cm;
+
+	@Reference
+	private ComponentManager componentManager;
+
+	@Reference(policy = DYNAMIC, policyOption = GREEDY, cardinality = OPTIONAL)
+	private volatile Timedata timedata;
+
+	@Reference(policy = STATIC, policyOption = GREEDY, cardinality = MANDATORY)
+	private BridgeMqtt mqttBridge;
+
+	private Config config;
+	private volatile Instant lastPowerMessage = null;
+
+	public EssMqttImpl() {
+		super(//
+				OpenemsComponent.ChannelId.values(), //
+				SymmetricEss.ChannelId.values(), //
+				MqttComponent.ChannelId.values() //
+		);
+	}
+
+	@Activate
+	private void activate(ComponentContext context, Config config) {
+		super.activate(context, config.id(), config.alias(), config.enabled());
+		this.config = config;
+		if (OpenemsComponent.updateReferenceFilter(this.cm, this.servicePid(), "mqttBridge", config.mqttBridge_id())) {
+			return;
+		}
+		this._setCapacity(config.capacity());
+		this._setMaxApparentPower(config.maxApparentPower());
+		this.channel(SymmetricEss.ChannelId.GRID_MODE).setNextValue(GridMode.ON_GRID);
+		if (!isSet(config.socTopic()) || !isSet(config.activePowerTopic())) {
+			this.logWarn(this.log, "SoC and Active Power topics should both be configured");
+		}
+		if (config.enabled()) {
+			this.subscribe();
+		}
+	}
+
+	@Override
+	@Deactivate
+	protected void deactivate() {
+		this.subscriptions.unsubscribeAll();
+		super.deactivate();
+	}
+
+	private void subscribe() {
+		try {
+			var c = this.config;
+			var b = this.mqttBridge;
+			this.subscriptions.subscribe(b, c.socTopic(), m -> this._setSoc(toInt(this.parse(m))));
+			this.subscriptions.subscribe(b, c.activePowerTopic(), this::onActivePower);
+			this.subscriptions.subscribe(b, c.chargeEnergyTopic(),
+					m -> this._setActiveChargeEnergy(toLong(this.scaleEnergy(this.parse(m)))));
+			this.subscriptions.subscribe(b, c.dischargeEnergyTopic(),
+					m -> this._setActiveDischargeEnergy(toLong(this.scaleEnergy(this.parse(m)))));
+			this.subscriptions.subscribe(b, c.minCellVoltageTopic(),
+					m -> this._setMinCellVoltage(toInt(scale(this.parse(m), 1000)))); // V -> mV
+			this.subscriptions.subscribe(b, c.maxCellVoltageTopic(),
+					m -> this._setMaxCellVoltage(toInt(scale(this.parse(m), 1000)))); // V -> mV
+			this.subscriptions.subscribe(b, c.temperatureTopic(), m -> {
+				var t = toInt(this.parse(m));
+				this._setMinCellTemperature(t);
+				this._setMaxCellTemperature(t);
+			});
+			this._setMqttCommunicationFailed(false);
+		} catch (RuntimeException e) {
+			this.logError(this.log, "Failed to subscribe to MQTT topics: " + e.getMessage());
+			this._setMqttCommunicationFailed(true);
+		}
+	}
+
+	@Override
+	public void retryMqttCommunication() {
+		this.subscriptions.unsubscribeAll();
+		this.subscribe();
+	}
+
+	private Double parse(MqttMessage message) {
+		return MqttValues.parseDouble(message.payloadAsString(), this.config.jsonPath());
+	}
+
+	private static Double scale(Double value, double factor) {
+		return value == null ? null : value * factor;
+	}
+
+	private Double scaleEnergy(Double value) {
+		return scale(value, this.config.energyScale());
+	}
+
+	private void onActivePower(MqttMessage message) {
+		var value = scale(this.parse(message), this.config.powerScale() * (this.config.invertPower() ? -1 : 1));
+		this._setActivePower(toInt(value));
+		this.lastPowerMessage = Instant.now(this.componentManager.getClock());
+		this._setMqttCommunicationFailed(false);
+	}
+
+	@Override
+	public void handleEvent(Event event) {
+		if (!this.isEnabled()) {
+			return;
+		}
+		switch (event.getTopic()) {
+		case EdgeEventConstants.TOPIC_CYCLE_BEFORE_PROCESS_IMAGE -> this.checkTimeout();
+		case EdgeEventConstants.TOPIC_CYCLE_AFTER_PROCESS_IMAGE -> this.calculateEnergy();
+		}
+	}
+
+	private void checkTimeout() {
+		if (this.config.timeoutSeconds() <= 0) {
+			return;
+		}
+		var last = this.lastPowerMessage;
+		var now = Instant.now(this.componentManager.getClock());
+		if (last != null && Duration.between(last, now).getSeconds() > this.config.timeoutSeconds()) {
+			this._setActivePower(null);
+			this._setMqttCommunicationFailed(true);
+		}
+	}
+
+	private void calculateEnergy() {
+		var activePower = this.getActivePower().get();
+		if (!isSet(this.config.chargeEnergyTopic())) {
+			this.calculateChargeEnergy.update(activePower == null ? null : Math.max(0, -activePower));
+		}
+		if (!isSet(this.config.dischargeEnergyTopic())) {
+			this.calculateDischargeEnergy.update(activePower == null ? null : Math.max(0, activePower));
+		}
+	}
+
+	private void _setMqttCommunicationFailed(boolean value) {
+		this.channel(MqttComponent.ChannelId.MQTT_COMMUNICATION_FAILED).setNextValue(value);
+	}
+
+	@Override
+	public Timedata getTimedata() {
+		return this.timedata;
+	}
+
+	@Override
+	public String debugLog() {
+		return "SoC:" + this.getSoc().asString() + "|L:" + this.getActivePower().asString();
+	}
+
+	@Override
+	public ModbusSlaveTable getModbusSlaveTable(AccessMode accessMode) {
+		return new ModbusSlaveTable(//
+				OpenemsComponent.getModbusSlaveNatureTable(accessMode), //
+				SymmetricEss.getModbusSlaveNatureTable(accessMode));
+	}
+}
