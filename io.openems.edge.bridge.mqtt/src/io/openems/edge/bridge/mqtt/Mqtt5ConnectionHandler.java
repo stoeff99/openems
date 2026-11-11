@@ -14,6 +14,7 @@ import org.eclipse.paho.mqttv5.client.MqttAsyncClient;
 import org.eclipse.paho.mqttv5.client.MqttCallback;
 import org.eclipse.paho.mqttv5.client.MqttConnectionOptions;
 import org.eclipse.paho.mqttv5.client.MqttDisconnectResponse;
+import org.eclipse.paho.mqttv5.client.persist.MemoryPersistence;
 import org.eclipse.paho.mqttv5.common.MqttException;
 import org.eclipse.paho.mqttv5.common.MqttMessage;
 import org.eclipse.paho.mqttv5.common.packet.MqttProperties;
@@ -60,7 +61,7 @@ public class Mqtt5ConnectionHandler implements MqttConnectionHandler, MqttCallba
 		this.shouldReconnect = true;
 
 		try {
-			this.client = new MqttAsyncClient(this.serverUri, this.clientId);
+			this.client = new MqttAsyncClient(this.serverUri, this.clientId, new MemoryPersistence());
 			this.client.setCallback(this);
 
 			var options = new MqttConnectionOptions();
@@ -88,7 +89,8 @@ public class Mqtt5ConnectionHandler implements MqttConnectionHandler, MqttCallba
 			callback.onConnected();
 
 		} catch (MqttException e) {
-			this.log.error("MQTT 5.0 connection failed: {}", e.getMessage());
+			this.log.error("MQTT 5.0 connection to {} failed: {} (reason code {}{})", this.serverUri, e.getMessage(),
+					e.getReasonCode(), e.getCause() != null ? ", cause: " + e.getCause() : "");
 			callback.onConnectionFailed(e.getMessage());
 			this.scheduleReconnect();
 		}

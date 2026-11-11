@@ -16,6 +16,7 @@ import org.eclipse.paho.client.mqttv3.MqttCallback;
 import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
 import org.eclipse.paho.client.mqttv3.MqttException;
 import org.eclipse.paho.client.mqttv3.MqttMessage;
+import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -64,7 +65,7 @@ public class Mqtt3ConnectionHandler implements MqttConnectionHandler, MqttCallba
 		this.shouldReconnect = true;
 
 		try {
-			this.client = new MqttAsyncClient(this.serverUri, this.clientId);
+			this.client = new MqttAsyncClient(this.serverUri, this.clientId, new MemoryPersistence());
 			this.client.setCallback(this);
 
 			var options = new MqttConnectOptions();
@@ -97,7 +98,9 @@ public class Mqtt3ConnectionHandler implements MqttConnectionHandler, MqttCallba
 			callback.onConnected();
 
 		} catch (MqttException e) {
-			this.log.error("{} connection failed: {}", this.mqttVersion.getDisplayName(), e.getMessage());
+			this.log.error("{} connection to {} failed: {} (reason code {}{})", this.mqttVersion.getDisplayName(),
+					this.serverUri, e.getMessage(), e.getReasonCode(),
+					e.getCause() != null ? ", cause: " + e.getCause() : "");
 			callback.onConnectionFailed(e.getMessage());
 			this.scheduleReconnect();
 		}
